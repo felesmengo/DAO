@@ -1,0 +1,260 @@
+// SPDX-License-Identifier: MIT
+
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+contract CCKPSY is ERC1155, Ownable {
+    string public constant name = unicode"CCK";
+    string public constant symbol = unicode"PSY";
+
+    string private _baseImageURI; // ipfs://bafybeid3o3qbjgkmopkezl43a4fcmsw3g5cmyxq2mun5dphjfo5iy5sjea/{id}
+
+    string[] validFunctions = ["setVotesNeeded", "setMinTokenBalance", "setMaxActiveProposals", "setTokenPrice", "issueNewToken", "setMaxTokenPurchase", "setMaxAmount"];
+
+    uint256 public MAX_AMOUNT = 63e6;
+    uint256 public _numTokensIssued;
+    uint256 public TokenID = 1; // $ONE ID series
+    uint256 public tokenPrice = 100000000000000; // Price amount in wei (0,0001 POL)
+    uint256 public maxTokenPurchase = 1e6;
+    uint256 public minTokenBalance = 1;
+    uint256 public totalVotesForOwner;
+    uint256 public totalVotesAgainstOwner;
+    uint256 public votesNeeded = 1;
+    uint256 public maxActiveProposalsTotal = 3;
+    uint256 public activeProposalsCount;
+
+    bool public saleIsActive = false;
+
+    address public contractOwner;
+
+    // Structure of a proposal
+    struct Proposal {
+        address proposer;
+        string description;
+        uint256 votesFor;
+        uint256 votesAgainst;
+        bool executed;
+    }
+
+    // Mapping of proposals by function
+    mapping(string => Proposal[]) public proposalsByFunction;
+    // Mapping to track votes for each role
+    mapping(string => mapping(uint256 => uint256)) public votesForFunction;
+    // Mapping to track whether an address has already voted on a proposal
+    mapping(string => mapping(uint256 => mapping(address => bool))) hasVoted;
+    // Maps the number of owner votes for each proposal
+    mapping(string => mapping(uint256 => uint256)) public ownerVotesForProposal;     // in favor
+    mapping(string => mapping(uint256 => uint256)) public ownerVotesAgainstProposal; // against
+    // Mapeamento para armazenar se uma proposta foi processada ou não
+    mapping(string => mapping(uint256 => bool)) private processedProposalIds;
+    // Event to vote on a proposal
+    //mapping(address => uint256) public tokenBalance;
+    mapping(uint256 => uint256) public tokenBalance;
+    mapping(address => uint256) public tokenBalanceByAddress;
+
+    event TokenPriceUpdated(uint newTokenPrice, address indexed changedBy);
+    event MaxAmountUpdated(uint newMaxAmount, address indexed changedBy);
+    event NewTokenIssued(string newBaseImageURI, uint8 newTokenId, address indexed changedBy);
+    event MaxTokenPurchaseUpdated(uint newMaxTokenPurchase, address indexed changedBy);
+    event Voted(address indexed changedBy, string functionName, uint8 proposalId, bool inSupport);
+    event VotesNeededUpdated(uint newVotesNeeded, address indexed changedBy);
+    event MinTokenBalanceUpdated(uint _minTokenBalance, address indexed changedBy);
+    event MaxActiveProposalsUpdated(uint8 _maxActiveProposals, address indexed changedBy);
+    event ProposalCanceled(string functionName, uint8 proposalId);
+
+    constructor(string memory baseImageURI) ERC1155(baseImageURI) Ownable(msg.sender) {
+        _baseImageURI = baseImageURI;
+        _mint(msg.sender, TokenID, 3e6, "");
+        _numTokensIssued += 3e6;
+        tokenBalance[TokenID] += 3e6;
+        tokenBalanceByAddress[msg.sender] += 3e6;
+        contractOwner = msg.sender;
+    }
+
+    /// Let's carry on, Mint $ONE
+    function mintOneFungibleToken(uint256 quantity) public payable {
+        require(saleIsActive, "Sale must be active to mint $ONE");
+        require(quantity > 0, "Quantity must be greater than zero!");
+        require(quantity <= maxTokenPurchase, "Can only mint `1_000_000` tokens at a time!");
+        require(_numTokensIssued + quantity <= MAX_AMOUNT, "The purchase would exceed the maximum token supply of that ID series.");
+        require(SafeMath.mul(tokenPrice, quantity) <= msg.value, "POL value sent is not correct!");
+        _mint(msg.sender, TokenID, quantity, "");
+        _numTokensIssued += quantity;
+        tokenBalance[TokenID] += quantity;
+        tokenBalanceByAddress[msg.sender] += quantity;
+    }
+
+    // Pause sale if active, make active if paused
+    function flipSaleState() public onlyOwner {
+        saleIsActive = !saleIsActive;
+    }
+
+    // Withdraws the contract's balance to the owner's address
+    function withdraw() public onlyOwner {
+        uint balance = address(this).balance;
+        payable(msg.sender).transfer(balance);
+    }
+
+    // Custom implementation of totalSupply
+    function totalSupply() public view returns (uint256) {
+        return _numTokensIssued;
+    }
+
+    // Returns the base URI associated with the current TokenID
+    function getBaseURI() public view returns(string memory) {
+        return uri(TokenID);
+    }
+
+    // Function to check the balance of a TokenID
+    function getTokenBalance(uint8 _tokenId) public view returns (uint) {
+        return tokenBalance[_tokenId];
+    }
+
+    // Create a new proposal
+    function createProposal(string memory functionName, string memory description) public {
+        require(isValidFunction(functionName), "Invalid function name");
+        require(tokenBalanceByAddress[msg.sender] >= minTokenBalance, "Insufficient tokens to create a proposal");
+        require(!hasActiveProposal(functionName), "There is already an active proposal for this function");
+        require(activeProposalsCount < maxActiveProposalsTotal, "Maximum number of active proposals reached for the contract");
+        proposalsByFunction[functionName].push(Proposal(msg.sender, description, 0, 0, false));
+        activeProposalsCount++;
+    }
+
+    // Check if there are active proposals for a specific function
+    function hasActiveProposal(string memory functionName) internal view returns (bool) {
+        Proposal[] storage proposals = proposalsByFunction[functionName];
+        for (uint256 i = 0; i < proposals.length; i++) {
+        if (!proposals[i].executed) {
+            return true; // Active proposal found
+            }
+        }
+            return false; // No active proposals found
+    }
+
+    // Verify if a proposal is a valid function
+    function isValidFunction(string memory functionName) internal view returns (bool) {
+        for (uint256 i = 0; i < validFunctions.length; i++) {
+        if (keccak256(bytes(functionName)) == keccak256(bytes(validFunctions[i]))) {
+            return true; // Valid function found
+            }
+        }
+            return false; // Invalid function
+    }
+
+    // Vote on a proposal
+    function vote(string memory functionName, uint8 proposalId, bool inSupport) public {
+        require(tokenBalanceByAddress[msg.sender] >= minTokenBalance, "Insufficient tokens to vote");
+        require(msg.sender != contractOwner, "Owner cannot vote");
+        require(proposalId < proposalsByFunction[functionName].length, "Invalid proposal ID");
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(!hasVoted[functionName][proposalId][msg.sender], "Address has already voted for this proposal");
+
+        Proposal storage proposal = proposalsByFunction[functionName][proposalId];
+        if (inSupport) {
+            proposal.votesFor++;
+            ownerVotesForProposal[functionName][proposalId]++; // Increases the owner's votes in favor of this proposal
+        } else {
+            proposal.votesAgainst++;
+            ownerVotesAgainstProposal[functionName][proposalId]++; // Increases the owner's votes against this proposal
+        }
+        // Mark that the address has already voted for this proposal
+        hasVoted[functionName][proposalId][msg.sender] = true;
+        // Emit the `Voted` event
+        emit Voted(msg.sender, functionName, proposalId, inSupport);
+    }
+
+    /// Cancel a proposal
+    function cancelProposal(string memory functionName, uint8 proposalId) public onlyOwner {
+        require(isValidFunction(functionName), "Invalid function name");
+        require(proposalId < proposalsByFunction[functionName].length, "Invalid proposal ID");
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already canceled");
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit ProposalCanceled(functionName, proposalId);
+    }
+
+    /// Transfer ownership to another address
+    function transferOwnership(address newOwner) public override onlyOwner {
+        require(newOwner != address(0), "New owner address cannot be Zero address");
+        _transferOwnership(newOwner);
+        contractOwner = owner();
+    }
+
+    /// Renounce the contract and pass ownership to address(0) to lock the contract forever more.
+    function renounceTokenOwnership() public onlyOwner {
+        renounceOwnership();
+        contractOwner = owner();
+    }
+
+    // Functions that require community voting for approval
+
+    /// Function to change MAX_AMOUNT
+    function setMaxAmount(string memory functionName, uint8 proposalId, uint256 newMaxAmount) external onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        MAX_AMOUNT = newMaxAmount;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit MaxAmountUpdated(newMaxAmount, msg.sender);
+    }
+
+    /// Enables updating the maximum token mint limit at a time
+    function setMaxTokenPurchase(string memory functionName, uint8 proposalId, uint newMaxTokenPurchase) public onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        maxTokenPurchase = newMaxTokenPurchase;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit MaxTokenPurchaseUpdated(newMaxTokenPurchase, msg.sender);
+    }
+
+    /// Sets the new base image URI and token ID, and mints `3_000_000` tokens to contract owner
+    function issueNewToken(string memory functionName, uint8 proposalId, string memory newBaseImageURI, uint8 newTokenId) public onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        _setURI(newBaseImageURI);
+        TokenID = newTokenId;
+        _mint(msg.sender, TokenID, 3e6, "");
+        _numTokensIssued += 3e6;
+        tokenBalance[TokenID] += 3e6;
+        tokenBalanceByAddress[msg.sender] += 3e6;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit NewTokenIssued(newBaseImageURI, newTokenId, msg.sender);
+    }
+
+    /// Updates token price (value in wei)
+    function setTokenPrice(string memory functionName, uint8 proposalId, uint newTokenPrice) public onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        tokenPrice = newTokenPrice;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit TokenPriceUpdated(newTokenPrice, msg.sender);
+    }
+
+    /// Enables updating the votes needed to approve of a proposal
+    function setVotesNeeded(string memory functionName, uint8 proposalId, uint newVotesNeeded) public onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        votesNeeded = newVotesNeeded;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit VotesNeededUpdated(newVotesNeeded, msg.sender);
+    }
+
+    /// Defines the minimum balance of tokens required to vote on proposals
+    function setMinTokenBalance(string memory functionName, uint8 proposalId, uint _minTokenBalance) public onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        minTokenBalance = _minTokenBalance;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit MinTokenBalanceUpdated(_minTokenBalance, msg.sender);
+    }
+
+    /// Sets the maximum total number of active proposals allowed at a time
+    function setMaxActiveProposals(string memory functionName, uint8 proposalId, uint8 _maxActiveProposals) public onlyOwner {
+        require(!proposalsByFunction[functionName][proposalId].executed, "Proposal already executed");
+        require(ownerVotesForProposal[functionName][proposalId] >= votesNeeded && proposalsByFunction[functionName][proposalId].votesFor > proposalsByFunction[functionName][proposalId].votesAgainst, "Not enough votes to approve the proposal");
+        maxActiveProposalsTotal = _maxActiveProposals;
+        proposalsByFunction[functionName][proposalId].executed = true;
+        emit MaxActiveProposalsUpdated(_maxActiveProposals, msg.sender);
+    }
+}
